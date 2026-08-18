@@ -1,0 +1,12 @@
+apiVersion: platform.taskapp.io/v1alpha1
+kind: Component
+metadata:
+  labels:
+    app.kubernetes.io/name: component-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: payments
+spec:
+  owner: payments-team
+  repository:
+    name: payments
+    visibility: private
