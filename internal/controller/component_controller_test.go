@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -46,6 +47,15 @@ func newComponent(name string) *platformv1alpha1.Component {
 	}
 }
 
+func newComponentWithScaffold(name string) *platformv1alpha1.Component {
+	component := newComponent(name)
+	component.Spec.Scaffold = &platformv1alpha1.ScaffoldSpec{
+		Template: "golang-service",
+		Version:  "0.1.0",
+	}
+	return component
+}
+
 func getGitHubRepository(ctx context.Context, name string) *unstructured.Unstructured {
 	repo := &unstructured.Unstructured{}
 	repo.SetGroupVersionKind(githubRepositoryGVK)
@@ -63,6 +73,36 @@ func setReadyCondition(ctx context.Context, repo *unstructured.Unstructured, sta
 		},
 	}, "status", "conditions")).To(Succeed())
 	Expect(k8sClient.Status().Update(ctx, repo)).To(Succeed())
+}
+
+// makeRepositoryReady sets status.repoURL and a True Ready condition on the
+// component's owned GitHubRepository — the two things reconcileScaffold
+// requires before it will create a ScaffoldRequest.
+func makeRepositoryReady(ctx context.Context, name string) {
+	repo := getGitHubRepository(ctx, name)
+	Expect(unstructured.SetNestedField(repo.Object, "https://github.com/entr0pian/"+name, "status", "repoURL")).To(Succeed())
+	setReadyCondition(ctx, repo, "True", "Available", "repository ready")
+}
+
+func getScaffoldRequest(ctx context.Context, name string) (*unstructured.Unstructured, error) {
+	req := &unstructured.Unstructured{}
+	req.SetGroupVersionKind(scaffoldRequestGVK)
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, req)
+	return req, err
+}
+
+func setScaffoldCompleted(ctx context.Context, req *unstructured.Unstructured, templateRevision, commitSHA string) {
+	Expect(unstructured.SetNestedSlice(req.Object, []any{
+		map[string]any{
+			"type":    "Completed",
+			"status":  "True",
+			"reason":  "Completed",
+			"message": "scaffold committed to repository",
+		},
+	}, "status", "conditions")).To(Succeed())
+	Expect(unstructured.SetNestedField(req.Object, templateRevision, "status", "templateRevision")).To(Succeed())
+	Expect(unstructured.SetNestedField(req.Object, commitSHA, "status", "commitSHA")).To(Succeed())
+	Expect(k8sClient.Status().Update(ctx, req)).To(Succeed())
 }
 
 var _ = Describe("Component Controller", func() {
@@ -238,6 +278,120 @@ var _ = Describe("Component Controller", func() {
 			Expect(owner.UID).To(Equal(component.UID))
 			Expect(owner.Kind).To(Equal("Component"))
 			Expect(owner.APIVersion).To(Equal(platformv1alpha1.GroupVersion.String()))
+		})
+	})
+
+	Context("Scaffold", func() {
+		It("does not create a ScaffoldRequest before the GitHubRepository is ready", func() {
+			const name = "payments-scaffold-not-ready"
+			Expect(k8sClient.Create(ctx, newComponentWithScaffold(name))).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, newComponentWithScaffold(name))).To(Succeed())
+			})
+
+			reconcileComponent(name)
+
+			_, err := getScaffoldRequest(ctx, name)
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("creates a ScaffoldRequest with the resolved fields once the GitHubRepository is ready", func() {
+			const name = "payments-scaffold-create"
+			Expect(k8sClient.Create(ctx, newComponentWithScaffold(name))).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, newComponentWithScaffold(name))).To(Succeed())
+			})
+
+			reconcileComponent(name)
+			makeRepositoryReady(ctx, name)
+			reconcileComponent(name)
+
+			req, err := getScaffoldRequest(ctx, name)
+			Expect(err).NotTo(HaveOccurred())
+
+			componentRefName, _, _ := unstructured.NestedString(req.Object, "spec", "componentRef", "name")
+			Expect(componentRefName).To(Equal(name))
+			componentName, _, _ := unstructured.NestedString(req.Object, "spec", "componentName")
+			Expect(componentName).To(Equal(name))
+			repositoryName, _, _ := unstructured.NestedString(req.Object, "spec", "repositoryName")
+			Expect(repositoryName).To(Equal(name))
+			owner, _, _ := unstructured.NestedString(req.Object, "spec", "owner")
+			Expect(owner).To(Equal("entr0pian"))
+			template, _, _ := unstructured.NestedString(req.Object, "spec", "template")
+			Expect(template).To(Equal("golang-service"))
+			version, _, _ := unstructured.NestedString(req.Object, "spec", "version")
+			Expect(version).To(Equal("0.1.0"))
+
+			Expect(req.GetLabels()).To(HaveKeyWithValue("platform.taskapp.io/component", name))
+
+			// No ownerReference — see PLATFORM_API_ARCHITECTURE.md's
+			// CREATION EXCEPTION: ScaffoldRequest section.
+			Expect(metav1.GetControllerOf(req)).To(BeNil())
+
+			component := &platformv1alpha1.Component{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, component)).To(Succeed())
+			scaffolded := findCondition(component.Status.Conditions, "Scaffolded")
+			Expect(scaffolded).NotTo(BeNil())
+			Expect(scaffolded.Status).To(Equal(metav1.ConditionFalse))
+			Expect(scaffolded.Reason).To(Equal("ScaffoldPending"))
+
+			ready := findCondition(component.Status.Conditions, "Ready")
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal("ScaffoldPending"))
+		})
+
+		It("mirrors a completed ScaffoldRequest onto Component.status and never re-enters afterwards", func() {
+			const name = "payments-scaffold-complete"
+			Expect(k8sClient.Create(ctx, newComponentWithScaffold(name))).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, newComponentWithScaffold(name))).To(Succeed())
+			})
+
+			reconcileComponent(name)
+			makeRepositoryReady(ctx, name)
+			reconcileComponent(name)
+
+			req, err := getScaffoldRequest(ctx, name)
+			Expect(err).NotTo(HaveOccurred())
+			setScaffoldCompleted(ctx, req, "abc1234", "def5678")
+
+			reconcileComponent(name)
+
+			component := &platformv1alpha1.Component{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, component)).To(Succeed())
+
+			Expect(component.Status.Scaffold).NotTo(BeNil())
+			Expect(component.Status.Scaffold.Completed).To(BeTrue())
+			Expect(component.Status.Scaffold.TemplateRevision).To(Equal("abc1234"))
+			Expect(component.Status.Scaffold.CommitSHA).To(Equal("def5678"))
+
+			scaffolded := findCondition(component.Status.Conditions, "Scaffolded")
+			Expect(scaffolded).NotTo(BeNil())
+			Expect(scaffolded.Status).To(Equal(metav1.ConditionTrue))
+
+			ready := findCondition(component.Status.Conditions, "Ready")
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionTrue))
+			Expect(ready.Reason).To(Equal("Scaffolded"))
+
+			// Hard stop: deleting the ScaffoldRequest out-of-band after
+			// completion must not cause it to be recreated on a later
+			// reconcile, and the previously-mirrored status must survive.
+			Expect(k8sClient.Delete(ctx, req)).To(Succeed())
+
+			reconcileComponent(name)
+
+			_, err = getScaffoldRequest(ctx, name)
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, component)).To(Succeed())
+			Expect(component.Status.Scaffold).NotTo(BeNil())
+			Expect(component.Status.Scaffold.Completed).To(BeTrue())
+			Expect(component.Status.Scaffold.CommitSHA).To(Equal("def5678"))
+			scaffolded = findCondition(component.Status.Conditions, "Scaffolded")
+			Expect(scaffolded).NotTo(BeNil())
+			Expect(scaffolded.Status).To(Equal(metav1.ConditionTrue))
 		})
 	})
 })

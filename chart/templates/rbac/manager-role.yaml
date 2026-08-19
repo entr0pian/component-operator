@@ -53,3 +53,18 @@ rules:
   - githubrepositories/status
   verbs:
   - get
+- apiGroups:
+  - scaffold.taskapp.io
+  resources:
+  - scaffoldrequests
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - scaffold.taskapp.io
+  resources:
+  - scaffoldrequests/status
+  verbs:
+  - get

@@ -10,3 +10,6 @@ spec:
   repository:
     name: payments
     visibility: private
+  scaffold:
+    template: golang-service
+    version: "0.1.0"
