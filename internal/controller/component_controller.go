@@ -200,6 +200,13 @@ func buildGitHubRepository(component *platformv1alpha1.Component) (*unstructured
 	if err := unstructured.SetNestedField(desired.Object, visibilityOrDefault(component), "spec", "visibility"); err != nil {
 		return nil, err
 	}
+	// autoInit is always false: the XRD's own default (true) auto-creates a
+	// README commit, which makes the repository non-empty before the
+	// scaffold operator ever runs and trips its safe-fail-not-overwrite
+	// check (Blocked/RepositoryNotEmpty) instead of committing.
+	if err := unstructured.SetNestedField(desired.Object, false, "spec", "autoInit"); err != nil {
+		return nil, err
+	}
 
 	return desired, nil
 }
