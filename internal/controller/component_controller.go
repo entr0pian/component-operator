@@ -200,11 +200,15 @@ func buildGitHubRepository(component *platformv1alpha1.Component) (*unstructured
 	if err := unstructured.SetNestedField(desired.Object, visibilityOrDefault(component), "spec", "visibility"); err != nil {
 		return nil, err
 	}
-	// autoInit is always false: the XRD's own default (true) auto-creates a
-	// README commit, which makes the repository non-empty before the
-	// scaffold operator ever runs and trips its safe-fail-not-overwrite
-	// check (Blocked/RepositoryNotEmpty) instead of committing.
-	if err := unstructured.SetNestedField(desired.Object, false, "spec", "autoInit"); err != nil {
+	// autoInit is always true: GitHub's Git Data API (which scaffold-operator
+	// uses to write its scaffold commit) unconditionally rejects writes with
+	// 409 "Git Repository is empty" against a repository with zero commits
+	// -- confirmed live, not a timing issue. auto_init gives scaffold-operator
+	// a valid starting commit to build its one scaffold commit on top of
+	// (parent + base_tree); scaffold-operator's own safety check is what
+	// recognizes that lone starting commit as the expected baseline rather
+	// than unknown content -- see operators/scaffold-operator's RepositoryState.
+	if err := unstructured.SetNestedField(desired.Object, true, "spec", "autoInit"); err != nil {
 		return nil, err
 	}
 

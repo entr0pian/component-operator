@@ -137,7 +137,7 @@ var _ = Describe("Component Controller", func() {
 			Expect(componentRefName).To(Equal(name))
 
 			autoInit, _, _ := unstructured.NestedBool(repo.Object, "spec", "autoInit")
-			Expect(autoInit).To(BeFalse())
+			Expect(autoInit).To(BeTrue())
 
 			Expect(repo.GetLabels()).To(HaveKeyWithValue("platform.taskapp.io/component", name))
 			Expect(repo.GetLabels()).To(HaveKeyWithValue("platform.taskapp.io/owner", "team-payments"))

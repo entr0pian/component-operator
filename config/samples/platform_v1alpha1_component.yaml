@@ -9,7 +9,7 @@ spec:
   owner: payments-team
   repository:
     name: payments
-    visibility: private
+    visibility: public
   scaffold:
     template: golang-service
     version: "0.1.0"
