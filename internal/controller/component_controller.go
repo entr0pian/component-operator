@@ -35,18 +35,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/entr0pian/component-operator/api/v1alpha1"
 )
 
 // githubRepositoryGVK is crossplane-compositions' apis/githubrepository XR
-// (repo.taskapp.io/v1alpha1 GitHubRepository). Component is the one related
-// resource type this controller creates and owns directly — see
-// PLATFORM_API_ARCHITECTURE.md's OWNERSHIP EXCEPTION section. Every future
-// capability (Database, Queue, ...) stays on the default model instead: an
-// independent CR a developer creates directly, correlated only via
-// componentRef + label, never created by this controller.
+// (repo.taskapp.io/v1alpha1 GitHubRepository). Component creates and owns it
+// directly (ownerReference) — see PLATFORM_API_ARCHITECTURE.md's OWNERSHIP
+// EXCEPTION section. Every future capability (Database, Queue, ...) stays on
+// the default model instead: an independent CR a developer creates directly,
+// correlated only via componentRef + label, never created by this
+// controller.
 var githubRepositoryGVK = schema.GroupVersionKind{
 	Group:   "repo.taskapp.io",
 	Version: "v1alpha1",
@@ -55,8 +54,9 @@ var githubRepositoryGVK = schema.GroupVersionKind{
 
 // scaffoldRequestGVK is the scaffold-operator repo's scaffold.taskapp.io/v1alpha1
 // ScaffoldRequest. Component's controller creates it once its GitHubRepository
-// is ready, but deliberately does not own it — see PLATFORM_API_ARCHITECTURE.md's
-// CREATION EXCEPTION: ScaffoldRequest section.
+// is ready, and owns it the same way (ownerReference) — deleting the
+// Component cascade-deletes the ScaffoldRequest along with the real GitHub
+// repository. See PLATFORM_API_ARCHITECTURE.md's OWNERSHIP EXCEPTION section.
 var scaffoldRequestGVK = schema.GroupVersionKind{
 	Group:   "scaffold.taskapp.io",
 	Version: "v1alpha1",
@@ -265,12 +265,14 @@ func (r *ComponentReconciler) updateRepositoryStatus(component *platformv1alpha1
 	})
 }
 
-// reconcileScaffold creates a ScaffoldRequest once spec.scaffold is set and
-// the owned GitHubRepository is ready, then never re-enters — no
-// drift-correction and no re-creation once Component's own Scaffolded
-// condition has gone True, even if the ScaffoldRequest is later deleted
-// out-of-band or spec.scaffold changes (per platform-scaffolds' own
-// commitment not to auto-migrate an already-scaffolded repo).
+// reconcileScaffold creates a ScaffoldRequest, owned by this Component
+// (ownerReference — deleting Component cascade-deletes it along with the
+// real GitHub repository), once spec.scaffold is set and the owned
+// GitHubRepository is ready. It then never re-enters — no drift-correction
+// and no re-creation once Component's own Scaffolded condition has gone
+// True, even if the ScaffoldRequest is later deleted out-of-band or
+// spec.scaffold changes (per platform-scaffolds' own commitment not to
+// auto-migrate an already-scaffolded repo).
 func (r *ComponentReconciler) reconcileScaffold(ctx context.Context, component *platformv1alpha1.Component, repo *unstructured.Unstructured) (*unstructured.Unstructured, error) {
 	log := logf.FromContext(ctx)
 
@@ -303,6 +305,9 @@ func (r *ComponentReconciler) reconcileScaffold(ctx context.Context, component *
 		if buildErr != nil {
 			return nil, buildErr
 		}
+		if err := controllerutil.SetControllerReference(component, desired, r.Scheme); err != nil {
+			return nil, err
+		}
 		if err := r.Create(ctx, desired); err != nil {
 			return nil, err
 		}
@@ -319,11 +324,9 @@ func (r *ComponentReconciler) reconcileScaffold(ctx context.Context, component *
 // buildScaffoldRequest resolves componentName/repositoryName/owner/template/
 // version once and writes them directly into spec — the ScaffoldRequest is
 // self-contained, so the scaffold operator never needs to read Component.
-// Deliberately no controllerutil.SetControllerReference call: this is the
-// one place in this controller that intentionally does not set an
-// ownerReference, so the ScaffoldRequest survives Component deletion as a
-// standalone audit record — see PLATFORM_API_ARCHITECTURE.md's CREATION
-// EXCEPTION: ScaffoldRequest section.
+// The caller (reconcileScaffold) sets a controller ownerReference on the
+// result, same as buildGitHubRepository — see PLATFORM_API_ARCHITECTURE.md's
+// OWNERSHIP EXCEPTION section.
 func buildScaffoldRequest(component *platformv1alpha1.Component, repo *unstructured.Unstructured) (*unstructured.Unstructured, error) {
 	owner, err := ownerFromRepository(repo)
 	if err != nil {
@@ -564,25 +567,8 @@ func (r *ComponentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		Watches(
 			scaffoldRequestType,
-			handler.EnqueueRequestsFromMapFunc(mapScaffoldRequestToComponent),
+			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &platformv1alpha1.Component{}),
 		).
 		Named("component").
 		Complete(r)
-}
-
-// mapScaffoldRequestToComponent enqueues the owning Component by reading the
-// platform.taskapp.io/component label — ScaffoldRequest has no
-// ownerReference to key off (see PLATFORM_API_ARCHITECTURE.md's CREATION
-// EXCEPTION: ScaffoldRequest), unlike the GitHubRepository watch above.
-func mapScaffoldRequestToComponent(_ context.Context, obj client.Object) []reconcile.Request {
-	componentName := obj.GetLabels()["platform.taskapp.io/component"]
-	if componentName == "" {
-		return nil
-	}
-	return []reconcile.Request{{
-		NamespacedName: types.NamespacedName{
-			Name:      componentName,
-			Namespace: obj.GetNamespace(),
-		},
-	}}
 }

@@ -327,12 +327,17 @@ var _ = Describe("Component Controller", func() {
 
 			Expect(req.GetLabels()).To(HaveKeyWithValue("platform.taskapp.io/component", name))
 
-			// No ownerReference — see PLATFORM_API_ARCHITECTURE.md's
-			// CREATION EXCEPTION: ScaffoldRequest section.
-			Expect(metav1.GetControllerOf(req)).To(BeNil())
-
+			// Owned the same way as GitHubRepository — deleting Component
+			// cascade-deletes the ScaffoldRequest too. See
+			// PLATFORM_API_ARCHITECTURE.md's OWNERSHIP EXCEPTION section.
 			component := &platformv1alpha1.Component{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, component)).To(Succeed())
+			reqOwner := metav1.GetControllerOf(req)
+			Expect(reqOwner).NotTo(BeNil())
+			Expect(reqOwner.UID).To(Equal(component.UID))
+			Expect(reqOwner.Kind).To(Equal("Component"))
+			Expect(reqOwner.APIVersion).To(Equal(platformv1alpha1.GroupVersion.String()))
+
 			scaffolded := findCondition(component.Status.Conditions, "Scaffolded")
 			Expect(scaffolded).NotTo(BeNil())
 			Expect(scaffolded.Status).To(Equal(metav1.ConditionFalse))
