@@ -321,8 +321,9 @@ func (r *ComponentReconciler) reconcileScaffold(ctx context.Context, component *
 	return existing, nil
 }
 
-// buildScaffoldRequest resolves componentName/repositoryName/owner/template/
-// version once and writes them directly into spec — the ScaffoldRequest is
+// buildScaffoldRequest resolves componentName/repositoryName/owner/
+// componentOwner/template/version once and writes them directly into spec —
+// the ScaffoldRequest is
 // self-contained, so the scaffold operator never needs to read Component.
 // The caller (reconcileScaffold) sets a controller ownerReference on the
 // result, same as buildGitHubRepository — see PLATFORM_API_ARCHITECTURE.md's
@@ -347,6 +348,7 @@ func buildScaffoldRequest(component *platformv1alpha1.Component, repo *unstructu
 		"componentName":  component.Name,
 		"repositoryName": repositoryName(component),
 		"owner":          owner,
+		"componentOwner": component.Spec.Owner,
 		"template":       component.Spec.Scaffold.Template,
 		"version":        component.Spec.Scaffold.Version,
 	}

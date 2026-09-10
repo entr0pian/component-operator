@@ -320,6 +320,8 @@ var _ = Describe("Component Controller", func() {
 			Expect(repositoryName).To(Equal(name))
 			owner, _, _ := unstructured.NestedString(req.Object, "spec", "owner")
 			Expect(owner).To(Equal("entr0pian"))
+			componentOwner, _, _ := unstructured.NestedString(req.Object, "spec", "componentOwner")
+			Expect(componentOwner).To(Equal("team-payments"))
 			template, _, _ := unstructured.NestedString(req.Object, "spec", "template")
 			Expect(template).To(Equal("golang-service"))
 			version, _, _ := unstructured.NestedString(req.Object, "spec", "version")
