@@ -431,7 +431,7 @@ func scaffoldCondition(req *unstructured.Unstructured) (metav1.ConditionStatus, 
 		}
 		switch cond["type"] {
 		case "Completed":
-			if cond["status"] == "True" {
+			if cond["status"] == string(metav1.ConditionTrue) {
 				message, _ := cond["message"].(string)
 				if message == "" {
 					message = "scaffold committed to repository"
@@ -439,7 +439,7 @@ func scaffoldCondition(req *unstructured.Unstructured) (metav1.ConditionStatus, 
 				return metav1.ConditionTrue, "Completed", message
 			}
 		case "Blocked":
-			if cond["status"] == "True" {
+			if cond["status"] == string(metav1.ConditionTrue) {
 				blocked = cond
 			}
 		}
@@ -508,7 +508,7 @@ func readyCondition(obj *unstructured.Unstructured) (metav1.ConditionStatus, str
 			continue
 		}
 		status := metav1.ConditionFalse
-		if cond["status"] == "True" {
+		if cond["status"] == string(metav1.ConditionTrue) {
 			status = metav1.ConditionTrue
 		}
 		reason, _ := cond["reason"].(string)
