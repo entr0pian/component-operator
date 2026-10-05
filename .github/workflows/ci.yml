@@ -1,48 +1,46 @@
 name: CI
 
+# Every check runs on every push and PR. On main, the image is pushed only
+# after all of them pass, then deployed to management: bump-infra.yml in
+# application-repositories pins infra/component-operator (chart and image) to
+# the commit. Set the repo variable AUTO_DEPLOY=false to stop the deploy.
 on:
   push:
-    branches:
-      - main
   pull_request:
-    branches:
-      - main
 
 permissions: {}
 
 jobs:
-  test:
+  lint:
+    uses: ./.github/workflows/lint.yml
     permissions:
       contents: read
-    name: Run on Ubuntu
-    runs-on: ubuntu-latest
-    steps:
-      - name: Clone the code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
 
-      - name: Setup Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
+  test:
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
 
-      - name: Running Tests
-        run: |
-          go mod tidy
-          make test
+  test-e2e:
+    uses: ./.github/workflows/test-e2e.yml
+    permissions:
+      contents: read
+
+  test-chart:
+    uses: ./.github/workflows/test-chart.yml
+    permissions:
+      contents: read
 
   docker-build-push:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    needs: test
+    needs: [lint, test, test-e2e, test-chart]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
-
     steps:
-      - name: Checkout repository
+      - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -69,3 +67,17 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
+
+  # No secrets here; bump-infra.yml gets its credentials through this job's
+  # OIDC token (bootstrap-cluster/terraform/github-actions-oidc).
+  deploy:
+    name: Deploy to management
+    needs: docker-build-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AUTO_DEPLOY != 'false'
+    permissions:
+      contents: read
+      id-token: write
+    uses: entr0pian/application-repositories/.github/workflows/bump-infra.yml@main
+    with:
+      component: component-operator
+      sha: ${{ github.sha }}

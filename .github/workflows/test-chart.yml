@@ -1,8 +1,8 @@
 name: Test Chart
 
+# Called by ci.yml, which gates the image push and deploy on it.
 on:
-  push:
-  pull_request:
+  workflow_call:
 
 permissions: {}
 
