@@ -1,165 +1,145 @@
 # component-operator
 
-Kubebuilder operator managing the `Component` CRD (`platform.taskapp.io/v1alpha1`)
-— the platform's central identity/metadata resource. See
-[`PLATFORM_API_ARCHITECTURE.md`](https://github.com/entr0pian/platform-architecture/blob/main/PLATFORM_API_ARCHITECTURE.md)
-for the full resource model this operator implements.
+A Kubernetes operator for the platform's **`Component`** API
+(`platform.taskapp.io/v1alpha1`): the identity record of a piece of software
+(name, owner, repository). From one small `Component` it creates a GitHub
+repository and asks for it to be seeded from a versioned template.
 
-## Description
+- **Identity, not orchestration.** `Component` owns only what is intrinsic to
+  it: its repository and the one-time scaffold. Databases, releases and other
+  capabilities are separate resources that point back with `componentRef`.
+- **Infrastructure through Crossplane.** The repository is a Crossplane
+  `GitHubRepository`. The operator never calls the GitHub API itself.
+- **Status in one place.** `kubectl get component` shows whether the repository
+  exists and whether scaffolding finished, and if not, why.
 
-A `Component` (`spec.owner`, `spec.repository.{name,visibility}`) is the
-stable identity a piece of platform software is correlated against. Per the
-architecture doc's default rule, Component does **not** create or own most
-related resources (Database, Queue, ComponentDeployment, ...) — those stay
-independent CRs a developer creates directly, linked back only via
-`spec.componentRef.name` + the `platform.taskapp.io/component` label.
+Written in Go with kubebuilder and controller-runtime. It runs on the
+platform's `management` cluster.
 
-The one named exception this controller implements is `GitHubRepository`
-(the `repo.taskapp.io/v1alpha1` XR from
-[`crossplane-compositions`](https://github.com/entr0pian/crossplane-compositions)'
-`apis/githubrepository` package): a component's source repo is treated as
-intrinsic to its identity rather than an optional capability, so
-`ComponentReconciler` builds and creates that XR from `spec.repository`, sets
-a controller `ownerReference` from Component to it, and keeps `repoName`/
-`visibility` in sync on every reconcile. `Component.status.repository` and
-the `Ready`/`RepositoryReady` conditions mirror the XR's own status back onto
-the Component. Deleting a Component therefore cascade-deletes the
-GitHubRepository XR and, through Crossplane's default `Delete` policy on the
-composed `provider-upjet-github` resource, the real GitHub repository — see
-the architecture doc's OWNERSHIP EXCEPTION section before relying on this.
+## Where it fits
 
-This operator is not yet wired into the deployment catalog
-(`application-repositories/catalog|infra/component-operator/*`) or ArgoCD —
-it's scaffolded and buildable, but not deployed anywhere yet.
-
-## Getting Started
-
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
-
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/component-operator:tag
+```mermaid
+flowchart LR
+    BS["Backstage<br/>Onboard Service"] -->|PR| AR["application-repositories<br/>platform/registry/&lt;name&gt;.yaml"]
+    AR -->|Argo CD| C["Component"]
+    C --> CO["component-operator"]
+    CO -->|owns| GR["GitHubRepository XR"]
+    GR -->|Crossplane| GH[("GitHub repo<br/>+ Argo CD webhook")]
+    CO -->|"owns, once repo is Ready"| SR["ScaffoldRequest"]
+    SR --> SO["scaffold-operator"]
+    SO -->|one commit| GH
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+The `GitHubRepository` API comes from
+[crossplane-compositions](https://github.com/entr0pian/crossplane-compositions),
+and [scaffold-operator](https://github.com/entr0pian/scaffold-operator) renders
+the template from [platform-scaffolds](https://github.com/entr0pian/platform-scaffolds).
+Once the repository's CI has built an image,
+[release-operator](https://github.com/entr0pian/release-operator) deploys it.
 
-**Install the CRDs into the cluster:**
+## The API
 
-```sh
-make install
+```yaml
+apiVersion: platform.taskapp.io/v1alpha1
+kind: Component
+metadata:
+  name: payments
+  namespace: platform
+spec:
+  owner: team-payments            # catalog owner
+  repository:
+    name: payments                # default: metadata.name
+    visibility: public            # public | private | internal, default private
+  scaffold:                       # optional, acted on once
+    template: golang-service
+    version: "0.12.0"
+status:
+  repository: {name, url, ready}
+  scaffold: {template, version, templateRevision, commitSHA, completed}
+  conditions: [Ready, RepositoryReady, Scaffolded]
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+Developers don't write this by hand. Backstage's Onboard Service template
+renders it into a pull request.
 
-```sh
-make deploy IMG=<some-registry>/component-operator:tag
+## What it does
+
+```mermaid
+flowchart TD
+    C[Component] --> G["create or patch GitHubRepository<br/>(repoName, visibility, ownerReference)"]
+    G --> RR{"repository Ready?"}
+    RR -->|no| W["RepositoryReady=False<br/>wait for Crossplane"]
+    RR -->|yes| S{"spec.scaffold set<br/>and not yet Scaffolded?"}
+    S -->|no| D["Ready"]
+    S -->|yes| SR["create ScaffoldRequest<br/>with every field resolved"]
+    SR --> M["mirror its Completed / Blocked<br/>onto Scaffolded"]
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+- **Repository.** Created on first reconcile. After that, only `repoName` and
+  `visibility` are kept in sync. Other fields on the XR are left alone.
+- **Scaffold.** Created only after the repository reports `Ready`, because the
+  GitHub owner is read from the XR's `status.repoURL`. The request carries
+  every value scaffold-operator needs, so scaffold-operator never reads
+  `Component`.
+- **Once means once.** After `Scaffolded=True`, changing `spec.scaffold` does
+  nothing. Upgrading an existing repository to a newer template is a separate,
+  deliberate change.
+- **Reacting to children.** It watches the `GitHubRepository` and
+  `ScaffoldRequest` it owns, so their status changes trigger a reconcile
+  without any polling.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+## Design choices
 
-```sh
-kubectl apply -k config/samples/
-```
+- **Two ownership exceptions, on purpose.** Most capabilities are independent
+  resources joined by `componentRef`, so `Component` doesn't grow into an
+  orchestration engine. The repository and its first commit are the exceptions:
+  a component without its source repository isn't a component.
+- **Deleting a Component deletes the repository.** The controller
+  `ownerReference` cascades to the XR, and Crossplane's default `Delete` policy
+  removes the real GitHub repository. Removing an onboarding file is therefore
+  a destructive change, and it goes through review like any other PR.
+- **`autoInit: true` on every repository.** GitHub's Git Data API, which
+  scaffold-operator uses to write its single commit, rejects writes to a
+  repository with no commits. An initial commit gives the scaffold a parent.
+- **Foreign types read as unstructured.** `GitHubRepository` and
+  `ScaffoldRequest` belong to other projects, and the operator doesn't vendor
+  their Go types. If either CRD isn't installed yet, it waits instead of
+  failing.
+- **No GitHub credentials.** Crossplane holds the token that creates
+  repositories, and scaffold-operator holds its own GitHub App. This operator
+  only needs Kubernetes RBAC.
 
->**NOTE**: Ensure that the samples has default values to test it out.
+## Status
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+`Ready=True` needs `RepositoryReady=True` and, when `spec.scaffold` is set,
+`Scaffolded=True`. Otherwise `Ready` carries the reason of whichever step is
+behind:
 
-```sh
-kubectl delete -k config/samples/
-```
+| Condition | Reasons |
+|---|---|
+| `RepositoryReady` | The XR's own `Ready` reason, `RepositoryProvisioning` before it reports, or `GitHubRepositoryCRDNotInstalled` |
+| `Scaffolded` | `Completed`, `ScaffoldPending`, or the request's `Blocked` reason and message, so you can see why scaffolding stalled |
 
-**Delete the APIs(CRDs) from the cluster:**
+## Delivery
 
-```sh
-make uninstall
-```
+Every push runs lint, unit/envtest, e2e on kind, and a Helm install test. On
+`main`, once all of them pass, CI pushes `ghcr.io/entr0pian/component-operator:<sha>`.
+The shared `bump-infra` workflow then pins this operator's chart and image to
+that SHA in `application-repositories`, and Argo CD rolls it out to
+`management`.
 
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/component-operator:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/component-operator/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
+## Development
 
 ```sh
-kubebuilder edit --plugins=helm/v2-alpha --output-dir=.
+make test       # unit + envtest
+make lint
+make test-e2e   # kind cluster
+make run        # against the current kubeconfig
 ```
 
-2. See that a chart was generated under 'chart/', and users
-can obtain this solution from there. This repo commits `chart/` (not
-`dist/`, which is gitignored build output) so ArgoCD can deploy straight
-from it.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'chart/values.yaml' or 'chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+The API lives in `api/v1alpha1/`. After changing it, run
+`make manifests generate` and mirror the CRD into `chart/templates/crd/`.
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache 2.0.
